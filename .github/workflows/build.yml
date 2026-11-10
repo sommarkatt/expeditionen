@@ -1,0 +1,1592 @@
+# Coachpilot version 1 - hela appen i en fil.
+# Spara filen i GitHub som .github/workflows/build.yml. Varje gång den sparas
+# bygger GitHub apk-filen och lägger den under Releases som coachpilot.apk.
+
+name: Bygg Coachpilot
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "signing/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Skriv källkoden
+        run: |
+          mkdir -p \
+            app \
+            app/src/main \
+            app/src/main/java/se/sommarkatt/coachpilot \
+            app/src/main/res/drawable \
+            app/src/main/res/mipmap-anydpi-v26 \
+            app/src/main/res/values
+
+          cat > settings.gradle <<'COACHPILOT_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'Coachpilot'
+          include ':app'
+          COACHPILOT_EOF
+
+          cat > build.gradle <<'COACHPILOT_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          COACHPILOT_EOF
+
+          cat > gradle.properties <<'COACHPILOT_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          COACHPILOT_EOF
+
+          cat > app/build.gradle <<'COACHPILOT_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          def vc = Integer.parseInt((project.findProperty('vc') ?: '1').toString())
+
+          android {
+              namespace 'se.sommarkatt.coachpilot'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'se.sommarkatt.coachpilot'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode vc
+                  versionName "1.${vc}"
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile rootProject.file('coachpilot.jks')
+                      storePassword 'coachpilot'
+                      keyAlias 'coachpilot'
+                      keyPassword 'coachpilot'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'COACHPILOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+              <uses-permission
+                  android:name="android.permission.SCHEDULE_EXACT_ALARM"
+                  android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <queries>
+                  <package android:name="com.anthropic.claude" />
+                  <intent>
+                      <action android:name="android.intent.action.ASSIST" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Coachpilot"
+                  android:supportsRtl="true"
+                  android:theme="@style/Setup">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".CallActivity"
+                      android:excludeFromRecents="true"
+                      android:exported="false"
+                      android:launchMode="singleTask"
+                      android:taskAffinity="se.sommarkatt.coachpilot.call"
+                      android:theme="@style/Call" />
+
+                  <receiver
+                      android:name=".AlarmReceiver"
+                      android:exported="false" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/AlarmReceiver.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.PowerManager;
+
+          /** Tar emot larmen (koll, samtal) och knapparna i notisen. */
+          public class AlarmReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  final Context ctx = context.getApplicationContext();
+                  final String action = intent.getAction() == null ? "" : intent.getAction();
+                  final boolean test = intent.getBooleanExtra(Coach.EXTRA_TEST, false);
+                  final PendingResult result = goAsync();
+                  PowerManager pm = ctx.getSystemService(PowerManager.class);
+                  final PowerManager.WakeLock lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "coachpilot:work");
+                  lock.acquire(45_000L);
+                  new Thread(() -> {
+                      try {
+                          switch (action) {
+                              case Coach.POLL:
+                                  Coach.syncSafe(ctx);
+                                  break;
+                              case Coach.RING:
+                                  Coach.ring(ctx, test);
+                                  break;
+                              case Coach.DECLINE:
+                                  Coach.stopRinging(ctx);
+                                  break;
+                              case Coach.DONE:
+                                  Coach.done(ctx, test);
+                                  break;
+                              default:
+                                  break;
+                          }
+                      } catch (Throwable ignored) {
+                          // nästa koll tar vid
+                      } finally {
+                          if (Coach.POLL.equals(action)) {
+                              try {
+                                  Coach.schedulePoll(ctx, Coach.POLL_MS);
+                              } catch (Throwable ignored) {
+                                  // ställs igen när appen öppnas
+                              }
+                          }
+                          if (lock.isHeld()) lock.release();
+                          result.finish();
+                      }
+                  }).start();
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/BootReceiver.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          /** Ställer larmen igen efter omstart och uppdatering. */
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  Context ctx = context.getApplicationContext();
+                  Store s = new Store(ctx);
+                  Coach.schedulePoll(ctx, Coach.MINUTE);
+                  if (!s.taskId().isEmpty()) {
+                      long at = Math.max(s.nextRing(), System.currentTimeMillis() + Coach.MINUTE);
+                      s.nextRing(at);
+                      Coach.scheduleRing(ctx, at);
+                  }
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/CallActivity.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import android.app.Activity;
+          import android.app.KeyguardManager;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.text.TextUtils;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          /** Det inkommande samtalet: helskärm, uppgiftens namn, rött och grönt. */
+          public class CallActivity extends Activity {
+              private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+              private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private final Runnable timeout = this::finish;
+              private final Runnable watch = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!Coach.isRinging(CallActivity.this)) {
+                          finish();
+                          return;
+                      }
+                      handler.postDelayed(this, 1000L);
+                  }
+              };
+              private boolean test;
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true);
+                      setTurnScreenOn(true);
+                  } else {
+                      getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                              | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+                  }
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  handle(getIntent());
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  handle(intent);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  handler.removeCallbacksAndMessages(null);
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  decline();
+              }
+
+              private void handle(Intent intent) {
+                  handler.removeCallbacksAndMessages(null);
+                  test = intent.getBooleanExtra(Coach.EXTRA_TEST, false);
+                  if (intent.getBooleanExtra(Coach.EXTRA_ANSWER, false)) {
+                      setContentView(new Ui.CircuitView(this));
+                      answer();
+                      return;
+                  }
+                  String name = intent.getStringExtra(Coach.EXTRA_NAME);
+                  setContentView(build(name == null ? "" : name));
+                  handler.postDelayed(timeout, Coach.RING_MS + 2000L);
+                  handler.postDelayed(watch, 1500L);
+              }
+
+              private void decline() {
+                  Coach.stopRinging(this);
+                  finish();
+              }
+
+              private void done() {
+                  Coach.stopRinging(this);
+                  sendBroadcast(new Intent(this, AlarmReceiver.class)
+                          .setAction(Coach.DONE)
+                          .putExtra(Coach.EXTRA_TEST, test));
+                  Toast.makeText(this, test ? "Provsamtalet är avslutat." : "Klart. Coachningen är avslutad.",
+                          Toast.LENGTH_SHORT).show();
+                  finish();
+              }
+
+              private void answer() {
+                  Coach.stopRinging(this);
+                  handler.removeCallbacksAndMessages(null);
+                  KeyguardManager km = getSystemService(KeyguardManager.class);
+                  if (km != null && km.isKeyguardLocked()) {
+                      km.requestDismissKeyguard(this, new KeyguardManager.KeyguardDismissCallback() {
+                          @Override
+                          public void onDismissSucceeded() {
+                              openClaude();
+                          }
+
+                          @Override
+                          public void onDismissCancelled() {
+                              finish();
+                          }
+
+                          @Override
+                          public void onDismissError() {
+                              openClaude();
+                          }
+                      });
+                  } else {
+                      openClaude();
+                  }
+              }
+
+              private void openClaude() {
+                  if (!Coach.openClaude(this)) {
+                      Toast.makeText(this, "Hittade inte Claude på den här enheten.", Toast.LENGTH_LONG).show();
+                  }
+                  finish();
+              }
+
+              private View build(String name) {
+                  FrameLayout root = new FrameLayout(this);
+                  root.addView(new Ui.CircuitView(this), new FrameLayout.LayoutParams(MATCH, MATCH));
+
+                  LinearLayout col = new LinearLayout(this);
+                  col.setOrientation(LinearLayout.VERTICAL);
+                  int side = Ui.dp(this, 36);
+                  col.setPadding(side, Ui.dp(this, 32), side, Ui.dp(this, 44));
+                  int width = Math.min(getResources().getDisplayMetrics().widthPixels, Ui.dp(this, 620));
+                  root.addView(col, new FrameLayout.LayoutParams(width, MATCH, Gravity.CENTER_HORIZONTAL));
+
+                  col.addView(Ui.text(this, Ui.logo(Color.WHITE, 0x66FFFFFF), 20, Color.WHITE, false));
+                  col.addView(new View(this), new LinearLayout.LayoutParams(MATCH, 0, 1f));
+
+                  col.addView(Ui.text(this, "Hur går det?", 22, 0xBFFFFFFF, true));
+
+                  TextView title = Ui.text(this, name, 44, Color.WHITE, true);
+                  title.setMaxLines(4);
+                  title.setEllipsize(TextUtils.TruncateAt.END);
+                  title.setLineSpacing(0f, 1.05f);
+                  LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  tlp.topMargin = Ui.dp(this, 10);
+                  col.addView(title, tlp);
+
+                  col.addView(new View(this), new LinearLayout.LayoutParams(MATCH, 0, 1.3f));
+
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_HORIZONTAL);
+                  row.addView(callButton(Ui.RED, true, "Mitt i det", v -> decline()));
+                  row.addView(new View(this), new LinearLayout.LayoutParams(Ui.dp(this, 96), 1));
+                  row.addView(callButton(Ui.GREEN, false, "Svara", v -> answer()));
+                  col.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                  TextView klar = Ui.text(this, "Klar", 16, Color.WHITE, false);
+                  klar.setGravity(Gravity.CENTER);
+                  klar.setPadding(Ui.dp(this, 32), Ui.dp(this, 11), Ui.dp(this, 32), Ui.dp(this, 11));
+                  GradientDrawable pill = new GradientDrawable();
+                  pill.setCornerRadius(Ui.dp(this, 24));
+                  pill.setStroke(Math.max(1, Ui.dp(this, 1)), 0x80FFFFFF);
+                  klar.setBackground(pill);
+                  klar.setOnClickListener(v -> done());
+                  LinearLayout.LayoutParams klp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                  klp.gravity = Gravity.CENTER_HORIZONTAL;
+                  klp.topMargin = Ui.dp(this, 40);
+                  col.addView(klar, klp);
+
+                  TextView hint = Ui.text(this,
+                          test ? "Provsamtal. Inget bockas av." : "Klar bockar av uppgiften i Todoist.",
+                          12, 0x8CFFFFFF, false);
+                  hint.setGravity(Gravity.CENTER);
+                  LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  hlp.topMargin = Ui.dp(this, 10);
+                  col.addView(hint, hlp);
+                  return root;
+              }
+
+              private View callButton(int color, boolean hangUp, String label, View.OnClickListener l) {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setGravity(Gravity.CENTER_HORIZONTAL);
+                  Ui.RoundButton b = new Ui.RoundButton(this, color, hangUp);
+                  b.setContentDescription(label);
+                  b.setOnClickListener(l);
+                  int size = Ui.dp(this, 76);
+                  box.addView(b, new LinearLayout.LayoutParams(size, size));
+                  TextView t = Ui.text(this, label, 14, 0xCCFFFFFF, false);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                  lp.topMargin = Ui.dp(this, 10);
+                  lp.gravity = Gravity.CENTER_HORIZONTAL;
+                  box.addView(t, lp);
+                  return box;
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/Coach.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import android.app.AlarmManager;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.ActivityNotFoundException;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.drawable.Icon;
+          import android.media.AudioAttributes;
+          import android.media.RingtoneManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.service.notification.StatusBarNotification;
+
+          import java.io.IOException;
+          import java.util.List;
+
+          /** Coachningens logik: läsa Todoist, ställa larm, ringa. */
+          final class Coach {
+              static final String CHANNEL = "samtal";
+              static final int NOTIFICATION = 7;
+              static final long MINUTE = 60_000L;
+              static final long RING_MS = 60_000L;
+              static final long POLL_MS = 10 * MINUTE;
+              static final String CLAUDE = "com.anthropic.claude";
+
+              static final String POLL = "se.sommarkatt.coachpilot.POLL";
+              static final String RING = "se.sommarkatt.coachpilot.RING";
+              static final String DECLINE = "se.sommarkatt.coachpilot.DECLINE";
+              static final String DONE = "se.sommarkatt.coachpilot.DONE";
+
+              static final String EXTRA_TEST = "test";
+              static final String EXTRA_NAME = "name";
+              static final String EXTRA_ANSWER = "answer";
+
+              private static final int FLAGS = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+
+              private Coach() {}
+
+              /** Läser coachningarna i Todoist och ställer nästa samtal. */
+              static synchronized void sync(Context ctx) throws IOException {
+                  Store s = new Store(ctx);
+                  String token = s.token();
+                  if (token.isEmpty()) return;
+                  List<Todoist.Task> tasks = Todoist.coachTasks(token);
+                  long now = System.currentTimeMillis();
+                  s.lastSync(now);
+
+                  String doneId = s.doneId();
+                  boolean doneSeen = false;
+                  Todoist.Task chosen = null;
+                  for (Todoist.Task t : tasks) {
+                      if (t.id.equals(doneId)) {
+                          doneSeen = true;
+                          continue;
+                      }
+                      if (chosen == null || t.since > chosen.since) chosen = t;
+                  }
+                  if (!doneId.isEmpty()) {
+                      if (!doneSeen) {
+                          s.doneId("");
+                      } else {
+                          try {
+                              Todoist.close(token, doneId);
+                              s.doneId("");
+                          } catch (IOException ignored) {
+                              // nytt försök vid nästa koll
+                          }
+                      }
+                  }
+
+                  if (chosen == null) {
+                      if (!s.taskId().isEmpty()) {
+                          s.clearTask();
+                          cancelRing(ctx);
+                      }
+                      return;
+                  }
+
+                  int interval = Todoist.interval(chosen.description, chosen.name);
+                  long next;
+                  if (!chosen.id.equals(s.taskId())) {
+                      long start = chosen.since > 0 && chosen.since <= now ? chosen.since : now;
+                      next = Math.max(start + interval * MINUTE, now + 30_000L);
+                  } else {
+                      next = s.nextRing();
+                      if (next < now) next = now + 30_000L;
+                  }
+                  s.task(chosen.id, chosen.name, interval);
+                  s.nextRing(next);
+                  scheduleRing(ctx, next);
+              }
+
+              static boolean syncSafe(Context ctx) {
+                  Store s = new Store(ctx);
+                  if (s.token().isEmpty()) return false;
+                  try {
+                      sync(ctx);
+                      s.note("");
+                      return true;
+                  } catch (Todoist.AuthException e) {
+                      s.note("Todoist godkänner inte nyckeln.");
+                  } catch (IOException e) {
+                      s.note("Kunde inte nå Todoist vid senaste kollen.");
+                  }
+                  return false;
+              }
+
+              static void ring(Context ctx, boolean test) {
+                  if (test) {
+                      showCall(ctx, "Provsamtal", true);
+                      return;
+                  }
+                  Store s = new Store(ctx);
+                  if (s.token().isEmpty()) return;
+                  String before = s.taskId();
+                  syncSafe(ctx);
+                  String id = s.taskId();
+                  if (id.isEmpty() || !id.equals(before)) return;
+                  long next = System.currentTimeMillis() + s.interval() * MINUTE;
+                  s.nextRing(next);
+                  scheduleRing(ctx, next);
+                  if (s.ringHere()) showCall(ctx, s.taskName(), false);
+              }
+
+              static synchronized void done(Context ctx, boolean test) {
+                  stopRinging(ctx);
+                  if (test) return;
+                  Store s = new Store(ctx);
+                  String id = s.taskId();
+                  if (id.isEmpty()) return;
+                  s.doneId(id);
+                  s.clearTask();
+                  cancelRing(ctx);
+                  try {
+                      Todoist.close(s.token(), id);
+                      s.doneId("");
+                  } catch (IOException e) {
+                      s.note("Kunde inte bocka av i Todoist. Försöker igen vid nästa koll.");
+                  }
+              }
+
+              static void ensureChannel(Context ctx) {
+                  NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                  if (nm.getNotificationChannel(CHANNEL) != null) return;
+                  NotificationChannel ch = new NotificationChannel(CHANNEL, "Samtal", NotificationManager.IMPORTANCE_HIGH);
+                  ch.setDescription("Coachpilot ringer medan en coachning pågår.");
+                  Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+                  if (sound == null) sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+                  AudioAttributes audio = new AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_ALARM)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                          .build();
+                  ch.setSound(sound, audio);
+                  ch.enableVibration(true);
+                  ch.setVibrationPattern(new long[]{0, 800, 600, 800, 600, 800, 1600});
+                  ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                  ch.setBypassDnd(true);
+                  nm.createNotificationChannel(ch);
+              }
+
+              static void showCall(Context ctx, String name, boolean test) {
+                  ensureChannel(ctx);
+                  NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                  Intent call = new Intent(ctx, CallActivity.class)
+                          .putExtra(EXTRA_NAME, name)
+                          .putExtra(EXTRA_TEST, test)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_USER_ACTION);
+                  PendingIntent callPi = PendingIntent.getActivity(ctx, 10, call, FLAGS);
+                  Intent answer = new Intent(call).putExtra(EXTRA_ANSWER, true);
+                  PendingIntent answerPi = PendingIntent.getActivity(ctx, 11, answer, FLAGS);
+                  PendingIntent declinePi = PendingIntent.getBroadcast(ctx, 12,
+                          new Intent(ctx, AlarmReceiver.class).setAction(DECLINE), FLAGS);
+
+                  Notification n = new Notification.Builder(ctx, CHANNEL)
+                          .setSmallIcon(R.drawable.ic_stat)
+                          .setContentTitle(name)
+                          .setContentText("Hur går det?")
+                          .setCategory(Notification.CATEGORY_ALARM)
+                          .setVisibility(Notification.VISIBILITY_PUBLIC)
+                          .setColor(Ui.BLUE)
+                          .setOngoing(true)
+                          .setAutoCancel(false)
+                          .setShowWhen(true)
+                          .setWhen(System.currentTimeMillis())
+                          .setTimeoutAfter(RING_MS)
+                          .setContentIntent(callPi)
+                          .setFullScreenIntent(callPi, true)
+                          .addAction(new Notification.Action.Builder((Icon) null, "Mitt i det", declinePi).build())
+                          .addAction(new Notification.Action.Builder((Icon) null, "Svara", answerPi).build())
+                          .build();
+                  n.flags |= Notification.FLAG_INSISTENT;
+                  nm.notify(NOTIFICATION, n);
+              }
+
+              static void stopRinging(Context ctx) {
+                  ctx.getSystemService(NotificationManager.class).cancel(NOTIFICATION);
+              }
+
+              static boolean isRinging(Context ctx) {
+                  NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                  for (StatusBarNotification n : nm.getActiveNotifications()) {
+                      if (n.getId() == NOTIFICATION) return true;
+                  }
+                  return false;
+              }
+
+              /** Grönt: öppna Claude, helst som assistent med röstläget. */
+              static boolean openClaude(Context ctx) {
+                  Intent launch = ctx.getPackageManager().getLaunchIntentForPackage(CLAUDE);
+                  Intent[] tries = {
+                          new Intent(Intent.ACTION_ASSIST).setPackage(CLAUDE),
+                          new Intent("android.intent.action.VOICE_ASSIST").setPackage(CLAUDE),
+                          new Intent(Intent.ACTION_VOICE_COMMAND).setPackage(CLAUDE),
+                          launch,
+                          new Intent(Intent.ACTION_ASSIST),
+                  };
+                  for (Intent i : tries) {
+                      if (i == null) continue;
+                      try {
+                          ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                          return true;
+                      } catch (ActivityNotFoundException | SecurityException ignored) {
+                          // prova nästa väg
+                      }
+                  }
+                  return false;
+              }
+
+              static void schedulePoll(Context ctx, long delay) {
+                  setAlarm(ctx, System.currentTimeMillis() + delay, broadcast(ctx, POLL, 2, false));
+              }
+
+              static void scheduleRing(Context ctx, long at) {
+                  setAlarm(ctx, at, broadcast(ctx, RING, 1, false));
+              }
+
+              static void scheduleTest(Context ctx, long delay) {
+                  setAlarm(ctx, System.currentTimeMillis() + delay, broadcast(ctx, RING, 3, true));
+              }
+
+              static void cancelRing(Context ctx) {
+                  ctx.getSystemService(AlarmManager.class).cancel(broadcast(ctx, RING, 1, false));
+              }
+
+              private static PendingIntent broadcast(Context ctx, String action, int code, boolean test) {
+                  Intent i = new Intent(ctx, AlarmReceiver.class).setAction(action);
+                  if (test) i.putExtra(EXTRA_TEST, true);
+                  return PendingIntent.getBroadcast(ctx, code, i, FLAGS);
+              }
+
+              private static void setAlarm(Context ctx, long at, PendingIntent pi) {
+                  AlarmManager am = ctx.getSystemService(AlarmManager.class);
+                  try {
+                      if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) {
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+                      } else {
+                          am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+                      }
+                  } catch (SecurityException e) {
+                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+                  }
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/MainActivity.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlarmManager;
+          import android.app.NotificationManager;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.res.ColorStateList;
+          import android.graphics.Color;
+          import android.graphics.drawable.RippleDrawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.inputmethod.InputMethodManager;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Switch;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.IOException;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          /** Inställningarna. Öppnas en gång vid installationen, sedan sköts allt från Expeditionen. */
+          public class MainActivity extends Activity {
+              private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+              private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+              private Store store;
+              private TextView status;
+              private TextView keyResult;
+              private EditText keyField;
+              private LinearLayout perms;
+              private boolean askedNotifications;
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  store = new Store(this);
+                  Coach.ensureChannel(this);
+                  getWindow().getDecorView().setSystemUiVisibility(
+                          View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+                  setContentView(build());
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  renderPerms();
+                  renderStatus();
+                  Coach.schedulePoll(this, Coach.POLL_MS);
+                  if (!store.token().isEmpty()) {
+                      new Thread(() -> {
+                          Coach.syncSafe(getApplicationContext());
+                          runOnUiThread(this::renderStatus);
+                      }).start();
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
+                  super.onRequestPermissionsResult(code, permissions, results);
+                  renderPerms();
+              }
+
+              private View build() {
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(Ui.GROUND);
+                  scroll.setFillViewport(true);
+
+                  LinearLayout col = new LinearLayout(this);
+                  col.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(32);
+                  col.setPadding(pad, dp(56), pad, dp(48));
+                  int width = Math.min(getResources().getDisplayMetrics().widthPixels, dp(640));
+                  scroll.addView(col, new FrameLayout.LayoutParams(width, WRAP, Gravity.CENTER_HORIZONTAL));
+
+                  col.addView(Ui.text(this, Ui.logo(Ui.BLUE, 0x66173A8C), 36, Ui.BLUE, false));
+                  col.addView(Ui.text(this, "Ringer medan en coachning pågår. Allt styrs från Expeditionen.",
+                          16, Ui.MUTED, false), below(10));
+
+                  heading(col, "Läge");
+                  status = Ui.text(this, "", 18, Ui.INK, false);
+                  status.setLineSpacing(0f, 1.3f);
+                  col.addView(status);
+
+                  heading(col, "Todoist-nyckel");
+                  keyField = new EditText(this);
+                  keyField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  keyField.setSingleLine(true);
+                  keyField.setHint("Klistra in nyckeln");
+                  keyField.setText(store.token());
+                  keyField.setTextColor(Ui.INK);
+                  keyField.setBackground(Ui.box(Color.WHITE, Ui.LINE, this));
+                  keyField.setPadding(dp(14), dp(12), dp(14), dp(12));
+                  col.addView(keyField, new LinearLayout.LayoutParams(MATCH, WRAP));
+                  col.addView(Ui.text(this, "Finns i Todoist under Inställningar, Integrationer, Utvecklare.",
+                          14, Ui.MUTED, false), below(8));
+                  col.addView(button("Spara och testa", true, v -> saveKey()), buttonBelow(16));
+                  keyResult = Ui.text(this, "", 15, Ui.INK, false);
+                  col.addView(keyResult, below(10));
+
+                  heading(col, "Behörigheter");
+                  perms = new LinearLayout(this);
+                  perms.setOrientation(LinearLayout.VERTICAL);
+                  col.addView(perms, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                  heading(col, "Den här enheten");
+                  Switch ring = new Switch(this);
+                  ring.setText("Ringer på den här enheten");
+                  ring.setTextSize(17);
+                  ring.setTextColor(Ui.INK);
+                  ring.setChecked(store.ringHere());
+                  ring.setOnCheckedChangeListener((b, on) -> {
+                      store.ringHere(on);
+                      renderStatus();
+                  });
+                  col.addView(ring, new LinearLayout.LayoutParams(MATCH, WRAP));
+                  col.addView(button("Provsamtal om 10 sekunder", false, v -> testCall()), buttonBelow(20));
+                  col.addView(Ui.text(this, "Lås skärmen direkt efteråt för att se samtalet i helskärm.",
+                          14, Ui.MUTED, false), below(8));
+
+                  col.addView(Ui.text(this, "Starta en coachning i Expeditionen, till exempel: "
+                          + "jag börjar med fars dag-kortet, coacha mig var 20:e minut.\n\n" + version(),
+                          13, Ui.MUTED, false), below(48));
+                  return scroll;
+              }
+
+              private void heading(LinearLayout col, String title) {
+                  TextView t = Ui.text(this, title, 14, Ui.BLUE, false);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  lp.topMargin = dp(40);
+                  lp.bottomMargin = dp(12);
+                  col.addView(t, lp);
+              }
+
+              private TextView button(String label, boolean primary, View.OnClickListener l) {
+                  TextView b = Ui.text(this, label, 16, primary ? Color.WHITE : Ui.BLUE, false);
+                  b.setGravity(Gravity.CENTER);
+                  b.setPadding(dp(22), dp(13), dp(22), dp(13));
+                  b.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33000000),
+                          primary ? Ui.box(Ui.BLUE, 0, this) : Ui.box(Ui.GROUND, Ui.BLUE, this), null));
+                  b.setClickable(true);
+                  b.setFocusable(true);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private void renderStatus() {
+                  if (isDestroyed()) return;
+                  StringBuilder sb = new StringBuilder();
+                  if (store.token().isEmpty()) {
+                      sb.append("Klistra in Todoist-nyckeln nedan för att komma igång.");
+                  } else if (store.taskId().isEmpty()) {
+                      sb.append("Ingen coachning pågår.");
+                  } else {
+                      sb.append("Coachar: ").append(store.taskName()).append('\n')
+                              .append("Nästa samtal ").append(clock(store.nextRing()))
+                              .append(", sedan var ").append(Ui.ordinal(store.interval())).append(" minut.");
+                  }
+                  if (!store.ringHere()) sb.append("\nDen här enheten ringer inte.");
+                  if (!store.note().isEmpty()) sb.append('\n').append(store.note());
+                  if (store.lastSync() > 0) sb.append("\nSenast kollat ").append(clock(store.lastSync())).append('.');
+                  status.setText(sb);
+              }
+
+              private void renderPerms() {
+                  perms.removeAllViews();
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  permRow("Notiser", nm.areNotificationsEnabled(), this::askNotifications);
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      permRow("Samtal i helskärm", nm.canUseFullScreenIntent(),
+                              () -> open(new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, packageUri())));
+                  }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      AlarmManager am = getSystemService(AlarmManager.class);
+                      if (!am.canScheduleExactAlarms()) {
+                          permRow("Ringa på exakt tid", false,
+                                  () -> open(new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, packageUri())));
+                      }
+                  }
+                  PowerManager pm = getSystemService(PowerManager.class);
+                  permRow("Ringa i bakgrunden", pm.isIgnoringBatteryOptimizations(getPackageName()),
+                          () -> open(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, packageUri())));
+              }
+
+              private void permRow(String label, boolean ok, Runnable fix) {
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+                  row.setMinimumHeight(dp(52));
+                  row.addView(Ui.text(this, label, 17, Ui.INK, false), new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  if (ok) {
+                      row.addView(Ui.text(this, "På", 15, Ui.MUTED, false));
+                  } else {
+                      TextView b = button("Slå på", true, v -> fix.run());
+                      b.setPadding(dp(18), dp(9), dp(18), dp(9));
+                      row.addView(b);
+                  }
+                  perms.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
+              }
+
+              private void askNotifications() {
+                  if (Build.VERSION.SDK_INT >= 33 && !askedNotifications
+                          && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      askedNotifications = true;
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+                  } else {
+                      open(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                              .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
+                  }
+              }
+
+              private void saveKey() {
+                  final String token = keyField.getText().toString().trim();
+                  InputMethodManager imm = getSystemService(InputMethodManager.class);
+                  if (imm != null) imm.hideSoftInputFromWindow(keyField.getWindowToken(), 0);
+                  keyField.clearFocus();
+                  if (token.isEmpty()) {
+                      keyResult.setText("Klistra in nyckeln först.");
+                      return;
+                  }
+                  store.token(token);
+                  keyResult.setText("Testar nyckeln …");
+                  new Thread(() -> {
+                      String msg;
+                      try {
+                          int n = Todoist.coachTasks(token).size();
+                          Coach.syncSafe(getApplicationContext());
+                          msg = n > 0 ? "Nyckeln fungerar. En coachning pågår." : "Nyckeln fungerar.";
+                      } catch (Todoist.AuthException e) {
+                          msg = "Todoist godkänner inte nyckeln. Kontrollera att hela nyckeln kom med.";
+                      } catch (IOException e) {
+                          msg = "Kunde inte nå Todoist. Kontrollera nätet och tryck igen.";
+                      }
+                      final String m = msg;
+                      runOnUiThread(() -> {
+                          if (isDestroyed()) return;
+                          keyResult.setText(m);
+                          renderStatus();
+                      });
+                  }).start();
+              }
+
+              private void testCall() {
+                  Coach.scheduleTest(this, 10_000L);
+                  Toast.makeText(this, "Det ringer om 10 sekunder.", Toast.LENGTH_SHORT).show();
+              }
+
+              private void open(Intent i) {
+                  try {
+                      startActivity(i);
+                  } catch (ActivityNotFoundException | SecurityException e) {
+                      try {
+                          startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri()));
+                      } catch (ActivityNotFoundException ignored) {
+                          // inget mer att prova
+                      }
+                  }
+              }
+
+              private Uri packageUri() {
+                  return Uri.parse("package:" + getPackageName());
+              }
+
+              private String version() {
+                  try {
+                      return "Coachpilot " + getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+                  } catch (PackageManager.NameNotFoundException e) {
+                      return "Coachpilot";
+                  }
+              }
+
+              private String clock(long t) {
+                  return new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date(t));
+              }
+
+              private int dp(float v) {
+                  return Ui.dp(this, v);
+              }
+
+              private LinearLayout.LayoutParams below(int top) {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  lp.topMargin = dp(top);
+                  return lp;
+              }
+
+              private LinearLayout.LayoutParams buttonBelow(int top) {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                  lp.topMargin = dp(top);
+                  return lp;
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/Store.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          /** Allt Coachpilot minns mellan samtalen. */
+          final class Store {
+              private final SharedPreferences p;
+
+              Store(Context c) {
+                  p = c.getApplicationContext().getSharedPreferences("coachpilot", Context.MODE_PRIVATE);
+              }
+
+              String token() { return p.getString("token", ""); }
+              void token(String v) { p.edit().putString("token", v).commit(); }
+
+              boolean ringHere() { return p.getBoolean("ringHere", true); }
+              void ringHere(boolean v) { p.edit().putBoolean("ringHere", v).commit(); }
+
+              String taskId() { return p.getString("taskId", ""); }
+              String taskName() { return p.getString("taskName", ""); }
+              int interval() { return p.getInt("interval", 20); }
+
+              void task(String id, String name, int interval) {
+                  p.edit().putString("taskId", id).putString("taskName", name).putInt("interval", interval).commit();
+              }
+
+              void clearTask() {
+                  p.edit().remove("taskId").remove("taskName").remove("nextRing").commit();
+              }
+
+              long nextRing() { return p.getLong("nextRing", 0L); }
+              void nextRing(long t) { p.edit().putLong("nextRing", t).commit(); }
+
+              String doneId() { return p.getString("doneId", ""); }
+              void doneId(String v) { p.edit().putString("doneId", v).commit(); }
+
+              String note() { return p.getString("note", ""); }
+              void note(String v) { p.edit().putString("note", v).commit(); }
+
+              long lastSync() { return p.getLong("lastSync", 0L); }
+              void lastSync(long t) { p.edit().putLong("lastSync", t).commit(); }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/Todoist.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import org.json.JSONArray;
+          import org.json.JSONException;
+          import org.json.JSONObject;
+          import org.json.JSONTokener;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.time.Instant;
+          import java.time.LocalDateTime;
+          import java.time.OffsetDateTime;
+          import java.time.ZoneOffset;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          /** Läser och bockar av coachningar i Todoist. En coachning är en uppgift med etiketten coach. */
+          final class Todoist {
+              static final String LABEL = "coach";
+              private static final String V1 = "https://api.todoist.com/api/v1/";
+              private static final String V2 = "https://api.todoist.com/rest/v2/";
+              private static final Pattern MINUTES =
+                      Pattern.compile("(\\d{1,3})\\s*(?::?[ae])?\\s*min", Pattern.CASE_INSENSITIVE);
+
+              static final class Task {
+                  final String id;
+                  final String name;
+                  final String description;
+                  final long since;
+
+                  Task(String id, String name, String description, long since) {
+                      this.id = id;
+                      this.name = name;
+                      this.description = description;
+                      this.since = since;
+                  }
+              }
+
+              static class HttpException extends IOException {
+                  final int code;
+
+                  HttpException(int code) {
+                      super("HTTP " + code);
+                      this.code = code;
+                  }
+              }
+
+              static final class AuthException extends HttpException {
+                  AuthException(int code) {
+                      super(code);
+                  }
+              }
+
+              private Todoist() {}
+
+              static List<Task> coachTasks(String token) throws IOException {
+                  String[] urls = {
+                          V1 + "tasks?label=" + LABEL + "&limit=200",
+                          V1 + "tasks/filter?query=%40" + LABEL + "&limit=200",
+                          V2 + "tasks?label=" + LABEL,
+                  };
+                  HttpException last = null;
+                  for (String url : urls) {
+                      try {
+                          return parse(request("GET", url, token));
+                      } catch (AuthException e) {
+                          throw e;
+                      } catch (HttpException e) {
+                          last = e;
+                      }
+                  }
+                  throw last;
+              }
+
+              /** Bockar av uppgiften. En uppgift som redan är borta räknas som avbockad. */
+              static void close(String token, String id) throws IOException {
+                  String[] urls = {V1 + "tasks/" + id + "/close", V2 + "tasks/" + id + "/close"};
+                  HttpException last = null;
+                  for (String url : urls) {
+                      try {
+                          request("POST", url, token);
+                          return;
+                      } catch (AuthException e) {
+                          throw e;
+                      } catch (HttpException e) {
+                          last = e;
+                      }
+                  }
+                  if (last.code == 404 || last.code == 410) return;
+                  throw last;
+              }
+
+              /** Intervallet i minuter, till exempel "var 20:e minut" i beskrivningen. Annars 20. */
+              static int interval(String description, String name) {
+                  int v = find(description);
+                  if (v < 0) v = find(name);
+                  if (v < 0) return 20;
+                  return Math.max(5, Math.min(120, v));
+              }
+
+              private static int find(String s) {
+                  if (s == null) return -1;
+                  Matcher m = MINUTES.matcher(s);
+                  if (!m.find()) return -1;
+                  try {
+                      return Integer.parseInt(m.group(1));
+                  } catch (NumberFormatException e) {
+                      return -1;
+                  }
+              }
+
+              private static List<Task> parse(String body) throws IOException {
+                  List<Task> out = new ArrayList<>();
+                  try {
+                      Object root = new JSONTokener(body).nextValue();
+                      JSONArray arr = null;
+                      if (root instanceof JSONArray) {
+                          arr = (JSONArray) root;
+                      } else if (root instanceof JSONObject) {
+                          arr = ((JSONObject) root).optJSONArray("results");
+                          if (arr == null) arr = ((JSONObject) root).optJSONArray("items");
+                      }
+                      if (arr == null) return out;
+                      for (int i = 0; i < arr.length(); i++) {
+                          JSONObject t = arr.optJSONObject(i);
+                          if (t == null) continue;
+                          if (t.optBoolean("checked") || t.optBoolean("is_completed") || t.optBoolean("is_deleted")) continue;
+                          if (!hasLabel(t.optJSONArray("labels"))) continue;
+                          String id = t.optString("id", "");
+                          if (id.isEmpty()) continue;
+                          String since = t.optString("updated_at", "");
+                          if (since.isEmpty() || "null".equals(since)) since = t.optString("added_at", "");
+                          if (since.isEmpty() || "null".equals(since)) since = t.optString("created_at", "");
+                          out.add(new Task(id, t.optString("content", "").trim(), t.optString("description", ""), time(since)));
+                      }
+                  } catch (JSONException e) {
+                      throw new IOException("Oväntat svar från Todoist", e);
+                  }
+                  return out;
+              }
+
+              private static boolean hasLabel(JSONArray labels) {
+                  if (labels == null) return false;
+                  for (int i = 0; i < labels.length(); i++) {
+                      Object o = labels.opt(i);
+                      String name = o instanceof JSONObject ? ((JSONObject) o).optString("name") : String.valueOf(o);
+                      if (LABEL.equalsIgnoreCase(name.trim())) return true;
+                  }
+                  return false;
+              }
+
+              static long time(String s) {
+                  if (s == null || s.isEmpty()) return 0L;
+                  try {
+                      return Instant.parse(s).toEpochMilli();
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      return OffsetDateTime.parse(s).toInstant().toEpochMilli();
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      return LocalDateTime.parse(s).toInstant(ZoneOffset.UTC).toEpochMilli();
+                  } catch (Exception ignored) {
+                  }
+                  return 0L;
+              }
+
+              private static String request(String method, String url, String token) throws IOException {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  try {
+                      c.setRequestMethod(method);
+                      c.setConnectTimeout(8000);
+                      c.setReadTimeout(8000);
+                      c.setRequestProperty("Authorization", "Bearer " + token.trim());
+                      c.setRequestProperty("Accept", "application/json");
+                      if ("POST".equals(method)) {
+                          c.setDoOutput(true);
+                          c.setFixedLengthStreamingMode(0);
+                          c.getOutputStream().close();
+                      }
+                      int code = c.getResponseCode();
+                      String body = read(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                      if (code == 401 || code == 403) throw new AuthException(code);
+                      if (code >= 400) throw new HttpException(code);
+                      return body;
+                  } finally {
+                      c.disconnect();
+                  }
+              }
+
+              private static String read(InputStream in) throws IOException {
+                  if (in == null) return "";
+                  ByteArrayOutputStream b = new ByteArrayOutputStream();
+                  byte[] buf = new byte[8192];
+                  int n;
+                  while ((n = in.read(buf)) > 0) b.write(buf, 0, n);
+                  in.close();
+                  return b.toString("UTF-8");
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/java/se/sommarkatt/coachpilot/Ui.java <<'COACHPILOT_EOF'
+          package se.sommarkatt.coachpilot;
+
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.RectF;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.text.SpannableString;
+          import android.text.Spanned;
+          import android.text.style.ForegroundColorSpan;
+          import android.util.TypedValue;
+          import android.view.View;
+          import android.widget.TextView;
+
+          /** Färger, typografi och de två ritade elementen: kretskortet och samtalsknapparna. */
+          final class Ui {
+              static final int BLUE = 0xFF173A8C;
+              static final int GROUND = 0xFFF4F5F7;
+              static final int INK = 0xFF14161B;
+              static final int MUTED = 0xFF6A707C;
+              static final int LINE = 0xFFDADDE3;
+              static final int GREEN = 0xFF2E9E62;
+              static final int RED = 0xFFD8473A;
+
+              private Ui() {}
+
+              static int dp(Context c, float v) {
+                  return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v,
+                          c.getResources().getDisplayMetrics()));
+              }
+
+              /** coachpilot i gemener, "ach" i en diskretare ton: på avstånd copilot, nära coach. */
+              static CharSequence logo(int color, int dim) {
+                  SpannableString s = new SpannableString("coachpilot");
+                  s.setSpan(new ForegroundColorSpan(color), 0, 2, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  s.setSpan(new ForegroundColorSpan(dim), 2, 5, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  s.setSpan(new ForegroundColorSpan(color), 5, 10, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  return s;
+              }
+
+              static TextView text(Context c, CharSequence s, float sp, int color, boolean light) {
+                  TextView t = new TextView(c);
+                  t.setText(s);
+                  t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+                  t.setTextColor(color);
+                  t.setTypeface(Typeface.create(light ? "sans-serif-light" : "sans-serif", Typeface.NORMAL));
+                  return t;
+              }
+
+              static GradientDrawable box(int fill, int stroke, Context c) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(fill);
+                  g.setCornerRadius(dp(c, 2));
+                  if (stroke != 0) g.setStroke(Math.max(1, dp(c, 1)), stroke);
+                  return g;
+              }
+
+              /** 20:e, 21:a, 22:a, 30:e ... */
+              static String ordinal(int n) {
+                  int last = n % 10;
+                  int lastTwo = n % 100;
+                  boolean a = (last == 1 || last == 2) && lastTwo != 11 && lastTwo != 12;
+                  return n + (a ? ":a" : ":e");
+              }
+
+              /** Stiliserat kretskort: få raka banor, en linjetjocklek, ett blått, mycket luft. */
+              static final class CircuitView extends View {
+                  // Hörn (0 uppe vänster, 1 uppe höger, 2 nere vänster, 3 nere höger),
+                  // sedan punkter i rutor räknat inåt från hörnet. Sista punkten får en lödpunkt.
+                  private static final float[][] TRACES = {
+                          {1, 0f, 2.5f, 2f, 2.5f, 3.5f, 1f, 5.5f, 1f},
+                          {0, 0f, 3.2f, 2f, 3.2f, 3f, 4.2f, 4.5f, 4.2f},
+                          {2, 0f, 4.5f, 0.8f, 4.5f, 1.8f, 3.5f, 1.8f, 1.5f},
+                          {3, 0f, 2f, 0.8f, 2f, 1.8f, 3f, 1.8f, 5f},
+                  };
+                  private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Path path = new Path();
+
+                  CircuitView(Context c) {
+                      super(c);
+                      line.setStyle(Paint.Style.STROKE);
+                      line.setStrokeWidth(dp(c, 1.5f));
+                      line.setStrokeJoin(Paint.Join.MITER);
+                      line.setColor(0x38FFFFFF);
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      c.drawColor(BLUE);
+                      float w = getWidth();
+                      float h = getHeight();
+                      float g = Math.min(w, h) / 12f;
+                      float pad = dp(getContext(), 4.5f);
+                      for (float[] t : TRACES) {
+                          int corner = (int) t[0];
+                          int n = (t.length - 1) / 2;
+                          float[] xs = new float[n];
+                          float[] ys = new float[n];
+                          for (int i = 0; i < n; i++) {
+                              float x = t[1 + i * 2] * g;
+                              float y = t[2 + i * 2] * g;
+                              xs[i] = (corner == 1 || corner == 3) ? w - x : x;
+                              ys[i] = (corner == 2 || corner == 3) ? h - y : y;
+                          }
+                          float dx = xs[n - 1] - xs[n - 2];
+                          float dy = ys[n - 1] - ys[n - 2];
+                          float len = (float) Math.hypot(dx, dy);
+                          path.reset();
+                          path.moveTo(xs[0], ys[0]);
+                          for (int i = 1; i < n - 1; i++) path.lineTo(xs[i], ys[i]);
+                          path.lineTo(xs[n - 1] - dx / len * pad, ys[n - 1] - dy / len * pad);
+                          c.drawPath(path, line);
+                          c.drawCircle(xs[n - 1], ys[n - 1], pad, line);
+                      }
+                  }
+              }
+
+              /** Rund samtalsknapp med en ritad lur. Röd lur ligger ner. */
+              static final class RoundButton extends View {
+                  private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final RectF oval = new RectF();
+                  private final boolean hangUp;
+
+                  RoundButton(Context c, int color, boolean hangUp) {
+                      super(c);
+                      this.hangUp = hangUp;
+                      fill.setColor(color);
+                      stroke.setColor(Color.WHITE);
+                      stroke.setStyle(Paint.Style.STROKE);
+                      stroke.setStrokeCap(Paint.Cap.ROUND);
+                      dot.setColor(Color.WHITE);
+                      setClickable(true);
+                      setFocusable(true);
+                  }
+
+                  @Override
+                  protected void drawableStateChanged() {
+                      super.drawableStateChanged();
+                      invalidate();
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      float cx = getWidth() / 2f;
+                      float cy = getHeight() / 2f;
+                      float r = Math.min(cx, cy);
+                      c.drawCircle(cx, cy, isPressed() ? r * 0.93f : r, fill);
+                      c.save();
+                      c.rotate(hangUp ? 135f : 0f, cx, cy);
+                      float d = r * 0.16f;
+                      float big = r * 0.44f;
+                      float ox = cx + d;
+                      float oy = cy - d;
+                      oval.set(ox - big, oy - big, ox + big, oy + big);
+                      stroke.setStrokeWidth(r * 0.13f);
+                      c.drawArc(oval, 95f, 80f, false, stroke);
+                      float end = r * 0.12f;
+                      for (float deg : new float[]{95f, 175f}) {
+                          double a = Math.toRadians(deg);
+                          c.drawCircle(ox + (float) Math.cos(a) * big, oy + (float) Math.sin(a) * big, end, dot);
+                      }
+                      c.restore();
+                  }
+              }
+          }
+          COACHPILOT_EOF
+
+          cat > app/src/main/res/drawable/ic_launcher_fg.xml <<'COACHPILOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M26,64 H44 L56,52 V45"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="4" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M50,39 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="4" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M82,58 H74 L68,64 V72"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="4" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M62,78 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="4" />
+          </vector>
+          COACHPILOT_EOF
+
+          cat > app/src/main/res/drawable/ic_stat.xml <<'COACHPILOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M3,17 H8 L13,12 V9"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="2" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M10.5,6.5 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="2" />
+          </vector>
+          COACHPILOT_EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'COACHPILOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/blue" />
+              <foreground android:drawable="@drawable/ic_launcher_fg" />
+          </adaptive-icon>
+          COACHPILOT_EOF
+
+          cat > app/src/main/res/values/colors.xml <<'COACHPILOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="blue">#FF173A8C</color>
+              <color name="ground">#FFF4F5F7</color>
+          </resources>
+          COACHPILOT_EOF
+
+          cat > app/src/main/res/values/styles.xml <<'COACHPILOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Setup" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:colorAccent">@color/blue</item>
+                  <item name="android:colorPrimary">@color/ground</item>
+                  <item name="android:colorPrimaryDark">@color/ground</item>
+                  <item name="android:windowBackground">@color/ground</item>
+                  <item name="android:statusBarColor">@color/ground</item>
+                  <item name="android:navigationBarColor">@color/ground</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+
+              <style name="Call" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:colorAccent">@android:color/white</item>
+                  <item name="android:windowBackground">@color/blue</item>
+                  <item name="android:statusBarColor">@color/blue</item>
+                  <item name="android:navigationBarColor">@color/blue</item>
+              </style>
+          </resources>
+          COACHPILOT_EOF
+
+      - name: Signeringsnyckel
+        run: |
+          if [ -f signing/coachpilot.jks.b64 ]; then
+            base64 -d signing/coachpilot.jks.b64 > coachpilot.jks
+          else
+            keytool -genkeypair -keystore coachpilot.jks -storepass coachpilot -keypass coachpilot \
+              -alias coachpilot -keyalg RSA -keysize 2048 -validity 20000 -dname "CN=Coachpilot"
+            mkdir -p signing
+            base64 -w0 coachpilot.jks > signing/coachpilot.jks.b64
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add signing/coachpilot.jks.b64
+            git commit -m "Signeringsnyckel för Coachpilot"
+            git push
+          fi
+
+      - name: Bygg apk
+        run: gradle assembleRelease -Pvc=${{ github.run_number }} --no-daemon --stacktrace
+
+      - name: Publicera under Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk coachpilot.apk
+          gh release create "v1.${{ github.run_number }}" coachpilot.apk \
+            --title "Coachpilot 1.${{ github.run_number }}" \
+            --notes "Ladda ner coachpilot.apk och installera." --latest
